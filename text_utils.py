@@ -2,6 +2,7 @@
 
 import re
 
+
 # Common abbreviations that should NOT trigger sentence splits.
 _ABBREVIATIONS = {
     "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
@@ -18,18 +19,26 @@ _ABBREVIATIONS = {
 
 def _is_abbreviation(word):
     """Check if a word is a common abbreviation that should not end a sentence."""
+    # Strip trailing punctuation and compare case-insensitively
     clean = word.rstrip(".,!?;:").lower()
     return clean in _ABBREVIATIONS
 
 
 def _split_sentences(text):
-    """Split text into sentences, avoiding false splits on abbreviations."""
+    """Split text into sentences, avoiding false splits on abbreviations.
+
+    Splits on . ! ? followed by whitespace, but does not split when the
+    preceding token is a known abbreviation (e.g. "Dr.", "U.S.", "e.g.").
+    """
+    # First, split on sentence-ending punctuation followed by whitespace
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
     sentences = []
     for part in parts:
         part = part.strip()
         if not part:
             continue
+        # If this part starts with a lowercase letter and the previous
+        # sentence ended with an abbreviation, merge them back together.
         if sentences and part and part[0].islower():
             last_word = sentences[-1].split()[-1] if sentences[-1].split() else ""
             if _is_abbreviation(last_word):
@@ -47,6 +56,9 @@ def chunk_text(text, min_words=200, max_words=250):
     max_words words per segment. Sentences are never broken up — if a single
     sentence exceeds max_words it is kept intact as its own chunk.
     Commas are never used as split points.
+
+    After initial chunking, any chunk below min_words is merged with the
+    previous chunk to avoid producing many tiny fragments.
     """
     if not text:
         return []
@@ -58,6 +70,8 @@ def chunk_text(text, min_words=200, max_words=250):
     current_words = 0
     for sentence in sentences:
         sentence_words = len(sentence.split())
+        # If adding this sentence would exceed max_words and we already have
+        # at least min_words, finalize the current chunk and start a new one.
         if current and current_words + sentence_words > max_words and current_words >= min_words:
             chunks.append(current)
             current = sentence

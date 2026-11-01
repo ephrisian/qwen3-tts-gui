@@ -1,6 +1,0 @@
-{
-  "name": "Qwen3-TTS Gradio Studio",
-  "description": "Gradio web app for Qwen3-TTS with CustomVoice, VoiceDesign with Random & Fixed seed controls, VoiceClone, and Output Audio Manager with playback.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

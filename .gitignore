@@ -1,8 +1,10 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
-!.env.example
+# Environments / caches / editor (all dot-folders)
+.*/
+
+# Generated audio and saved voices
+output/
+voices/
+
+# Python
+__pycache__/
+*.pyc

@@ -1,11 +1,6 @@
 """Model loading utilities for Qwen3-TTS."""
 
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    torch = None
-    TORCH_AVAILABLE = False
+import torch
 
 try:
     from qwen_tts import Qwen3TTSModel
@@ -13,20 +8,11 @@ except ImportError:
     Qwen3TTSModel = None
 
 
-def get_dtype_map():
-    if not TORCH_AVAILABLE:
-        return {}
-    return {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }
-
-
-def is_cuda_available():
-    if not TORCH_AVAILABLE:
-        return False
-    return torch.cuda.is_available()
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
 
 
 def load_model(model_id, device, dtype, attn):
@@ -40,20 +26,18 @@ def load_model(model_id, device, dtype, attn):
 
     Returns:
         Loaded Qwen3TTSModel instance.
-    """
-    if not TORCH_AVAILABLE:
-        raise ImportError(
-            "PyTorch is not installed. Please install PyTorch with: pip install torch"
-        )
 
+    Raises:
+        ImportError: If qwen-tts package is not installed.
+        Exception: If model loading fails.
+    """
     if Qwen3TTSModel is None:
         raise ImportError(
             "'qwen-tts' package is not installed. "
             "Install it with: pip install -U qwen-tts"
         )
 
-    dtype_map = get_dtype_map()
-    torch_dtype = dtype_map.get(dtype, torch.float32)
+    torch_dtype = DTYPE_MAP[dtype]
 
     print(f"Loading model: {model_id}")
     print(f"Device: {device} | Dtype: {dtype} | Attention: {attn}")
@@ -66,3 +50,47 @@ def load_model(model_id, device, dtype, attn):
         trust_remote_code=True,
     )
     return model
+
+
+class ModelManager:
+    """Lazily loads models by kind and keeps at most `max_loaded` in memory.
+
+    kind is a key of config.MODEL_MAP: 'voice-design' or 'voice-clone'.
+    `settings` is a callable returning (device, dtype, attn); changing them reloads models.
+    """
+
+    def __init__(self, settings, max_loaded=2):
+        import threading
+        from collections import OrderedDict
+        self._settings = settings
+        self._max = max_loaded
+        self._models = OrderedDict()
+        self._loaded_with = None
+        self._lock = threading.Lock()
+
+    def get(self, kind, notify=None):
+        from config import MODEL_MAP
+        with self._lock:
+            current = tuple(self._settings())
+            if current != self._loaded_with:
+                self._models.clear()
+                self._loaded_with = current
+            if kind in self._models:
+                self._models.move_to_end(kind)
+                return self._models[kind]
+            while len(self._models) >= self._max:
+                self._models.popitem(last=False)
+                self._free_memory()
+            if notify:
+                notify(f"Loading {kind} model…")
+            self._models[kind] = load_model(MODEL_MAP[kind], *current)
+            return self._models[kind]
+
+    @staticmethod
+    def _free_memory():
+        import gc
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
