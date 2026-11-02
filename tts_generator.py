@@ -63,6 +63,13 @@ class TTSGenerator:
             ref_audio=(wav, sr), ref_text=voice_library.SAMPLE_TEXT, x_vector_only_mode=False
         )
 
+    def build_clone_prompt(self, ref_audio, ref_text, x_vector_only=False):
+        """Build a voice-clone prompt from reference audio without generating audio."""
+        model = self.models.get("voice-clone", self.notify)
+        return model.create_voice_clone_prompt(
+            ref_audio=ref_audio, ref_text=ref_text or None, x_vector_only_mode=x_vector_only
+        )
+
     # ---- VoiceClone
     def clone(self, text, language, min_words, max_words, seed=None, temperature=0.7,
               voice_name=None, ref_audio="", ref_text=None, x_vector_only=False,
@@ -83,9 +90,10 @@ class TTSGenerator:
                 anchor_prompt = model.create_voice_clone_prompt(
                     ref_audio=ref_audio, ref_text=ref_text or None, x_vector_only_mode=x_vector_only
                 )
-                if save_prompt:
-                    save_voice_clone_prompt(save_prompt, anchor_prompt)
-                    self.notify(f"Voice-clone prompt saved to: {save_prompt}")
+
+        if save_prompt:
+            save_voice_clone_prompt(save_prompt, anchor_prompt)
+            self.notify(f"Voice-clone prompt saved to: {save_prompt}")
 
         jobs = self._jobs(text, min_words, max_words)
         bank = None

@@ -78,6 +78,33 @@ def normalize_wavs(wavs):
         return [wavs]
 
 
+def load_wav(path):
+    """Load a WAV file into (numpy array, sample rate) using only the standard library.
+
+    Handles 8-bit, 16-bit, and 32-bit PCM WAV; multi-channel is downmixed to mono.
+    """
+    import wave
+
+    with wave.open(path, "rb") as w:
+        n_channels = w.getnchannels()
+        sample_width = w.getsampwidth()
+        sr = w.getframerate()
+        raw = w.readframes(w.getnframes())
+
+    if sample_width == 1:
+        audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128) / 128.0
+    elif sample_width == 2:
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels)[:, 0]
+    return audio, sr
+
+
 def save_voice_clone_prompt(path, prompt):
     """Save a voice-clone prompt to NPZ, preserving object structure.
 

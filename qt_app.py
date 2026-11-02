@@ -4,8 +4,10 @@ All model work lives in tts_generator / voice_library / model_loader; this file
 only builds widgets and runs the backend on worker threads.
 """
 
+import json
 import os
 import random
+import shutil
 import sys
 import threading
 import uuid
@@ -16,7 +18,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import audio_player
 import voice_library
-from audio_utils import save_outputs, write_wav
+from audio_utils import save_outputs, write_wav, load_wav
 from config import (
     DEFAULT_ATTN, DEFAULT_DEVICE, DEFAULT_DTYPE, DEFAULT_LANGUAGE, DEFAULT_MAX_WORDS,
     DEFAULT_MIN_WORDS, ATTNS, DTYPES, LANGUAGES, MODEL_MAP, OUTPUT_DIR,
@@ -143,17 +145,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_output = None
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+        # ---- menu bar
+        menu = self.menuBar()
+        tools = menu.addMenu("Tools")
+        act_voice_mgr = tools.addAction("Voice Manager…")
+        act_voice_mgr.triggered.connect(self.open_voice_manager)
+
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
         root.addWidget(self._build_settings())
+        root.addLayout(self._build_status_bar())
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_design_tab(), "Voice Creator (VoiceDesign)")
         self.tabs.addTab(self._build_clone_tab(), "VoiceClone")
+        self.tabs.addTab(self._build_voices_tab(), "Voices")
         self.audiobook_tab = AudiobookTab(self, text_edit, combo, seed_row)
         self.tabs.addTab(self.audiobook_tab, "Audiobook")
         root.addWidget(self.tabs, 1)
-        root.addLayout(self._build_status_bar())
         self.refresh_voice_lists()
 
         screen = QtGui.QGuiApplication.primaryScreen().availableGeometry()
@@ -218,6 +227,10 @@ class MainWindow(QtWidgets.QMainWindow):
             audio_player.play(path)
         except Exception as e:
             self.status(f"Playback error: {e}")
+
+    def open_voice_manager(self):
+        dlg = VoiceManagerDialog(self)
+        dlg.exec()
 
     def request_stop(self):
         if self.task:
@@ -294,6 +307,22 @@ class MainWindow(QtWidgets.QMainWindow):
         note.setStyleSheet("color: gray")
         lay.addWidget(note)
 
+        # ---- auto-save + random name options
+        auto_row = QtWidgets.QHBoxLayout()
+        self.chk_vd_autosave = QtWidgets.QCheckBox("Auto-save generated voices")
+        self.chk_vd_autosave.setToolTip("Automatically save each generated sample as a voice.")
+        self.cmb_vd_name_gender = QtWidgets.QComboBox()
+        self.cmb_vd_name_gender.addItems(["Random", "Male", "Female"])
+        self.cmb_vd_name_gender.setToolTip("Gender used for auto-generated voice names.")
+        btn_vd_rand_name = QtWidgets.QPushButton("🎲 Random name")
+        btn_vd_rand_name.clicked.connect(self.fill_random_name)
+        auto_row.addWidget(self.chk_vd_autosave)
+        auto_row.addWidget(QtWidgets.QLabel("Name gender:"))
+        auto_row.addWidget(self.cmb_vd_name_gender)
+        auto_row.addWidget(btn_vd_rand_name)
+        auto_row.addStretch(1)
+        lay.addLayout(auto_row)
+
         saved = QtWidgets.QGroupBox("Saved voices")
         sl = QtWidgets.QHBoxLayout(saved)
         self.cmb_vd_saved = QtWidgets.QComboBox()
@@ -349,6 +378,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_vd_save.setEnabled(True)
             self.status("Sample ready. Listen, then name and save the voice if you like it.")
             self.play(result["preview"])
+            if self.chk_vd_autosave.isChecked():
+                gender = self.cmb_vd_name_gender.currentText().lower()
+                if gender == "random":
+                    gender = random.choice(["male", "female"])
+                base = voice_library.random_voice_name(gender)
+                name = voice_library.unique_voice_name(base)
+                self.edt_vd_name.setText(name)
+                self.save_voice(autosaved=True)
 
         self.run_task(work, done)
 
@@ -358,7 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.status("Generate a sample first.")
 
-    def save_voice(self):
+    def save_voice(self, autosaved=False):
         pending = self.pending_voice
         name = self.edt_vd_name.text().strip()
         if not pending:
@@ -369,11 +406,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         overwrite = False
         if voice_library.voice_exists(name):
-            answer = QtWidgets.QMessageBox.question(
-                self, "Overwrite voice?", f"A voice named '{name}' already exists. Replace it?")
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
-            overwrite = True
+            if autosaved:
+                name = voice_library.unique_voice_name(name)
+                self.edt_vd_name.setText(name)
+            else:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Overwrite voice?", f"A voice named '{name}' already exists. Replace it?")
+                if answer != QtWidgets.QMessageBox.Yes:
+                    return
+                overwrite = True
 
         def work(task):
             prompt = self.generator(task).build_voice_prompt(pending["wav"], pending["sr"])
@@ -391,6 +432,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status(f"Voice '{saved_name}' saved to voices/{voice_library.slugify(saved_name)}/")
 
         self.run_task(work, done)
+
+    def fill_random_name(self):
+        gender = self.cmb_vd_name_gender.currentText().lower()
+        if gender == "random":
+            gender = random.choice(["male", "female"])
+        name = voice_library.random_voice_name(gender)
+        name = voice_library.unique_voice_name(name)
+        self.edt_vd_name.setText(name)
+        self.status(f"Suggested name: {name}")
 
     def load_saved_into_creator(self):
         name = self.cmb_vd_saved.currentText()
@@ -453,7 +503,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "The Base (clone) model takes no instructions, so each [tag] is performed by generating a short "
             "emotional reference with VoiceDesign (voice description + tag), anchored to your voice's speaker "
             "embedding, and cloning from it. Identity stays close but not identical to the neutral voice; "
-            "audition emotional passages. " + DIRECTION_HELP)
+            "audition emotional passages. " + DIRECTION_HELP +
+            " The Voice Description box is used only when [emotion] tags are present; it is combined with each "
+            "tag to form the style instruct. Without tags, the box has no effect.")
         help_lbl.setWordWrap(True)
         help_lbl.setStyleSheet("color: gray")
         lay.addWidget(help_lbl)
@@ -496,6 +548,12 @@ class MainWindow(QtWidgets.QMainWindow):
         b3 = QtWidgets.QPushButton("Browse…")
         b3.clicked.connect(lambda: self.browse(self.edt_vc_save, "NPZ (*.npz)", save=True))
         g.addRow("Save prompt to (NPZ):", self.row_with(self.edt_vc_save, b3))
+
+        self.edt_vc_new_name = QtWidgets.QLineEdit()
+        self.edt_vc_new_name.setPlaceholderText("New voice name")
+        btn_vc_new = QtWidgets.QPushButton("Save as voice")
+        btn_vc_new.clicked.connect(self.save_clone_as_voice)
+        g.addRow("Save this clone as a voice:", self.row_with(self.edt_vc_new_name, btn_vc_new))
         lay.addWidget(self.grp_ref)
 
         self.btn_vc_generate = QtWidgets.QPushButton("Generate")
@@ -551,10 +609,331 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.run_task(lambda t: self.generator(t).clone(**args), self.finish_long_form("VoiceClone"))
 
+    def save_clone_as_voice(self):
+        """Build a clone prompt from reference audio and save it as a named voice."""
+        name = self.edt_vc_new_name.text().strip()
+        if not voice_library.slugify(name):
+            self.status("Error: enter a voice name.")
+            return
+        ref_audio = self.edt_vc_ref.text().strip()
+        if not ref_audio:
+            self.status("Error: provide reference audio first.")
+            return
+        ref_text = self.txt_vc_ref_text.toPlainText().strip() or None
+        x_vector_only = self.chk_vc_xvec.isChecked()
+        language = self.cmb_vc_lang.currentText()
+        description = self.txt_vc_instruct.toPlainText().strip()
+        seed = self.spn_vc_seed.value() if self.cmb_vc_seed_mode.currentText() == "Fixed" else 0
+
+        def work(task):
+            wav, sr = load_wav(ref_audio)
+            prompt = self.generator(task).build_clone_prompt(
+                ref_audio=(wav, sr), ref_text=ref_text, x_vector_only=x_vector_only)
+            overwrite = voice_library.voice_exists(name)
+            voice_library.save_voice(
+                name, wav, sr, prompt, description, language, seed,
+                model_ids=dict(MODEL_MAP), overwrite=overwrite)
+            return name
+
+        def done(saved_name):
+            self.refresh_voice_lists()
+            self.cmb_vc_voice.setCurrentText(saved_name)
+            self.status(f"Voice '{saved_name}' saved to voices/{voice_library.slugify(saved_name)}/")
+
+        self.run_task(work, done)
+
+    # ------------------------------------------------------------------ Voices tab
+    def _build_voices_tab(self):
+        page, lay, bar = tab_page(None)
+
+        lay.addWidget(QtWidgets.QLabel("All saved voices (stored in voices/<name>/):"))
+        self.tv_voices = QtWidgets.QTableWidget(0, 6)
+        self.tv_voices.setHorizontalHeaderLabels(
+            ["Name", "Description", "Language", "Seed", "Created", ""])
+        self.tv_voices.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.tv_voices.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        hh = self.tv_voices.horizontalHeader()
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        for c in (0, 2, 3, 4, 5):
+            hh.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
+        self.tv_voices.verticalHeader().hide()
+        lay.addWidget(self.tv_voices, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_refresh = QtWidgets.QPushButton("Refresh / Detect")
+        btn_refresh.setToolTip("Re-scan the voices folder and refresh the list.")
+        btn_refresh.clicked.connect(self.refresh_voices_tab)
+        btn_import = QtWidgets.QPushButton("Import voice…")
+        btn_import.setToolTip("Import a voice folder (must contain reference.wav + voice.json).")
+        btn_import.clicked.connect(self.import_voice)
+        btn_create = QtWidgets.QPushButton("Create from audio…")
+        btn_create.setToolTip("Build a new voice from a WAV file + transcript.")
+        btn_create.clicked.connect(self.create_voice_from_audio)
+        btn_rename = QtWidgets.QPushButton("Rename selected")
+        btn_rename.clicked.connect(self.rename_voice_tab)
+        btn_delete = QtWidgets.QPushButton("Delete selected")
+        btn_delete.clicked.connect(self.delete_voice_tab)
+        btn_play = QtWidgets.QPushButton("▶ Play reference")
+        btn_play.clicked.connect(self.play_voice_tab)
+        for b in (btn_refresh, btn_import, btn_create, btn_rename, btn_delete, btn_play):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+        self.refresh_voices_tab()
+        return page
+
+    def refresh_voices_tab(self):
+        details = voice_library.list_voice_details()
+        self.tv_voices.setRowCount(len(details))
+        for r, d in enumerate(details):
+            self.tv_voices.setItem(r, 0, QtWidgets.QTableWidgetItem(d["name"]))
+            self.tv_voices.setItem(r, 1, QtWidgets.QTableWidgetItem(d["description"]))
+            self.tv_voices.setItem(r, 2, QtWidgets.QTableWidgetItem(d["language"]))
+            self.tv_voices.setItem(r, 3, QtWidgets.QTableWidgetItem(str(d["seed"])))
+            self.tv_voices.setItem(r, 4, QtWidgets.QTableWidgetItem(d["created"]))
+            btn_play = QtWidgets.QPushButton("▶")
+            btn_play.setFixedWidth(30)
+            btn_play.clicked.connect(lambda _=0, slug=d["slug"]: self.play_voice_by_slug(slug))
+            self.tv_voices.setCellWidget(r, 5, btn_play)
+            self.tv_voices.item(r, 0).setData(QtCore.Qt.UserRole, d["slug"])
+        self.status(f"{len(details)} voice(s) found.")
+
+    def selected_voice_slugs(self):
+        slugs = []
+        for item in self.tv_voices.selectedItems():
+            if item.column() == 0:
+                slugs.append(item.data(QtCore.Qt.UserRole))
+        return sorted(set(slugs))
+
+    def selected_voice_slug(self):
+        slugs = self.selected_voice_slugs()
+        return slugs[0] if len(slugs) == 1 else None
+
+    def rename_voice_tab(self):
+        slug = self.selected_voice_slug()
+        if slug is None:
+            self.status("Error: select exactly one voice to rename.")
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename voice", f"New name for '{slug}':", text=slug)
+        if not ok or not name.strip():
+            return
+        try:
+            voice_library.rename_voice(slug, name.strip())
+            self.refresh_voices_tab()
+            self.refresh_voice_lists()
+        except Exception as e:
+            self.status(f"Rename failed: {e}")
+
+    def delete_voice_tab(self):
+        slugs = self.selected_voice_slugs()
+        if not slugs:
+            return
+        names = ", ".join(slugs)
+        answer = QtWidgets.QMessageBox.question(
+            self, "Delete voices?",
+            f"Delete {len(slugs)} voice(s): {names}? This cannot be undone.")
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        for slug in slugs:
+            voice_library.delete_voice(slug)
+        self.refresh_voices_tab()
+        self.refresh_voice_lists()
+
+    def play_voice_tab(self):
+        slug = self.selected_voice_slug()
+        if slug is None:
+            self.status("Error: select exactly one voice to play.")
+            return
+        self.play_voice_by_slug(slug)
+
+    def play_voice_by_slug(self, slug):
+        path = os.path.join(voice_library.voice_dir(slug), "reference.wav")
+        if not os.path.isfile(path):
+            self.status(f"Error: reference.wav not found for '{slug}'.")
+            return
+        self.play(path)
+
+    def import_voice(self):
+        src = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select voice folder to import", voice_library.VOICES_DIR)
+        if not src:
+            return
+        cfg_path = os.path.join(src, "voice.json")
+        wav_path = os.path.join(src, "reference.wav")
+        if not os.path.isfile(cfg_path):
+            self.status("Error: selected folder has no voice.json.")
+            return
+        if not os.path.isfile(wav_path):
+            self.status("Error: selected folder has no reference.wav.")
+            return
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError) as e:
+            self.status(f"Error reading voice.json: {e}")
+            return
+        name = cfg.get("name", os.path.basename(src))
+        if not voice_library.slugify(name):
+            self.status("Error: voice name is invalid.")
+            return
+        name = voice_library.unique_voice_name(name)
+        dst = voice_library.voice_dir(name)
+        if os.path.exists(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        # Ensure voice.json name matches the new folder name
+        cfg["name"] = name
+        with open(os.path.join(dst, "voice.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        self.refresh_voices_tab()
+        self.refresh_voice_lists()
+        self.status(f"Imported voice '{name}'.")
+
+    def create_voice_from_audio(self):
+        """Build a new voice from a WAV file + transcript (no model generation needed for the prompt)."""
+        wav_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select reference audio", "", "Audio (*.wav *.mp3 *.flac *.m4a *.ogg)")
+        if not wav_path:
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "New voice name", "Voice name:", text=os.path.splitext(os.path.basename(wav_path))[0])
+        if not ok or not voice_library.slugify(name.strip()):
+            self.status("Error: enter a valid voice name.")
+            return
+        name = voice_library.unique_voice_name(name.strip())
+        language, ok2 = QtWidgets.QInputDialog.getItem(
+            self, "Language", "Language:", LANGUAGES, 0, False)
+        if not ok2:
+            return
+        description, ok3 = QtWidgets.QInputDialog.getMultiLineText(
+            self, "Voice description", "Describe the voice (used for [emotion] tags):", "")
+        if not ok3:
+            return
+        seed, ok4 = QtWidgets.QInputDialog.getInt(
+            self, "Seed", "Seed (0 = random):", 0, 0, 2**31 - 1)
+        if not ok4:
+            return
+        if seed == 0:
+            seed = random.randint(0, 2**31 - 1)
+
+        def work(task):
+            wav, sr = load_wav(wav_path)
+            prompt = self.generator(task).build_clone_prompt(
+                ref_audio=(wav, sr), ref_text=None, x_vector_only=True)
+            voice_library.save_voice(
+                name, wav, sr, prompt, description, language, seed,
+                model_ids=dict(MODEL_MAP), overwrite=False)
+            return name
+
+        def done(saved_name):
+            self.refresh_voices_tab()
+            self.refresh_voice_lists()
+            self.status(f"Voice '{saved_name}' created from audio.")
+
+        self.run_task(work, done)
+
     @property
     def action_buttons(self):
         return (self.btn_vd_generate, self.btn_vd_save, self.btn_vc_generate,
                 self.audiobook_tab.btn_render, self.audiobook_tab.btn_preview)
+
+
+# ------------------------------------------------------------------ Voice Manager dialog
+class VoiceManagerDialog(QtWidgets.QDialog):
+    """View, rename, and delete all saved voices."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Voice Manager")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(400)
+
+        lay = QtWidgets.QVBoxLayout(self)
+
+        lay.addWidget(QtWidgets.QLabel("All saved voices (stored in voices/<name>/):"))
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Name", "Description", "Language", "Seed", "Created"])
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        for c in (0, 2, 3, 4):
+            hh.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.verticalHeader().hide()
+        lay.addWidget(self.table, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_rename = QtWidgets.QPushButton("Rename selected")
+        self.btn_rename.clicked.connect(self.rename_selected)
+        self.btn_delete = QtWidgets.QPushButton("Delete selected")
+        self.btn_delete.clicked.connect(self.delete_selected)
+        btn_refresh = QtWidgets.QPushButton("Refresh")
+        btn_refresh.clicked.connect(self.refresh)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        for b in (btn_refresh, self.btn_rename, self.btn_delete, btn_close):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+        self.refresh()
+
+    def refresh(self):
+        details = voice_library.list_voice_details()
+        self.table.setRowCount(len(details))
+        for r, d in enumerate(details):
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(d["name"]))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(d["description"]))
+            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(d["language"]))
+            self.table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(d["seed"])))
+            self.table.setItem(r, 4, QtWidgets.QTableWidgetItem(d["created"]))
+            # store slug for operations
+            self.table.item(r, 0).setData(QtCore.Qt.UserRole, d["slug"])
+
+    def selected_slugs(self):
+        slugs = []
+        for item in self.table.selectedItems():
+            if item.column() == 0:
+                slugs.append(item.data(QtCore.Qt.UserRole))
+        return sorted(set(slugs))
+
+    def rename_selected(self):
+        slugs = self.selected_slugs()
+        if len(slugs) != 1:
+            QtWidgets.QMessageBox.information(
+                self, "Rename voice", "Select exactly one voice to rename.")
+            return
+        slug = slugs[0]
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename voice", f"New name for '{slug}':", text=slug)
+        if not ok or not name.strip():
+            return
+        try:
+            voice_library.rename_voice(slug, name.strip())
+            self.refresh()
+            if self.parent():
+                self.parent().refresh_voice_lists()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Rename failed", str(e))
+
+    def delete_selected(self):
+        slugs = self.selected_slugs()
+        if not slugs:
+            return
+        names = ", ".join(slugs)
+        answer = QtWidgets.QMessageBox.question(
+            self, "Delete voices?",
+            f"Delete {len(slugs)} voice(s): {names}? This cannot be undone.")
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        for slug in slugs:
+            voice_library.delete_voice(slug)
+        self.refresh()
+        if self.parent():
+            self.parent().refresh_voice_lists()
 
 
 def main():
