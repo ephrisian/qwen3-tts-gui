@@ -84,6 +84,24 @@ Windows: `install.bat` handles installation; use `conda activate qwen3-tts && py
 
 Linux/macOS: `./manage_qwen.sh {install|run|remove|cleanup|purge}`
 
+## Inference benchmark
+
+List saved voices, then benchmark one voice against the same text and seed across
+chunk sizes, dtypes, and attention backends:
+
+```bash
+python launch.py benchmark --list-voices
+python launch.py benchmark --voice narrator --text-file benchmark.txt --seed 42 \
+   --chunk-sizes 0,250,400,600 --dtypes bfloat16,float16 \
+   --attentions flash_attention_2,sdpa --warmups 1 --repeats 3
+```
+
+The benchmark records model-load time separately from warmed generation time,
+reports median real-time factor (lower is faster), and saves a WAV per successful
+configuration for listening comparisons. Results are written to a timestamped
+folder under `output/` as `results.csv`. Use a UTF-8 text file representative of
+your normal workload; the full configuration grid can take a while to run.
+
 ## Notes
 
 - Models are downloaded on first use into the project-local `.hf_cache` directory (via `HF_HOME`).

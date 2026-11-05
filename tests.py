@@ -390,6 +390,16 @@ def _test_emotion_tags_and_seed():
     print("PASS: emotion tags and seeding")
 
 
+def _test_benchmark_helpers():
+    from benchmark import chunk_bounds, real_time_factor
+    assert chunk_bounds(0) == (0, 0)
+    assert chunk_bounds(250) == (200, 250)
+    assert chunk_bounds(1) == (1, 1)
+    assert real_time_factor(12, 60) == 0.2
+    assert real_time_factor(1, 0) is None
+    print("PASS: benchmark helpers")
+
+
 # ------------------------------------------------------------------ runner
 
 def run_tests():
@@ -416,6 +426,7 @@ def run_tests():
     _test_audiobook_cache_and_grouping()
     _test_voice_library_roundtrip()
     _test_emotion_tags_and_seed()
+    _test_benchmark_helpers()
     print("All tests passed.")
 
 

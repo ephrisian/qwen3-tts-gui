@@ -323,22 +323,6 @@ class MainWindow(QtWidgets.QMainWindow):
         auto_row.addStretch(1)
         lay.addLayout(auto_row)
 
-        saved = QtWidgets.QGroupBox("Saved voices")
-        sl = QtWidgets.QHBoxLayout(saved)
-        self.cmb_vd_saved = QtWidgets.QComboBox()
-        self.cmb_vd_saved.setMinimumWidth(220)
-        btn_load = QtWidgets.QPushButton("Load into creator")
-        btn_load.clicked.connect(self.load_saved_into_creator)
-        btn_play = QtWidgets.QPushButton("▶ Play reference")
-        btn_play.clicked.connect(self.play_saved_reference)
-        btn_del = QtWidgets.QPushButton("Delete")
-        btn_del.clicked.connect(self.delete_saved)
-        for w in (self.cmb_vd_saved, btn_load, btn_play, btn_del):
-            sl.addWidget(w)
-        sl.addStretch(1)
-        lay.addWidget(saved)
-        lay.addStretch(1)
-
         self.btn_vd_generate = QtWidgets.QPushButton("Generate sample")
         self.btn_vd_generate.clicked.connect(self.generate_sample)
         self.btn_vd_play = QtWidgets.QPushButton("▶ Play sample")
@@ -428,7 +412,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def done(saved_name):
             self.refresh_voice_lists()
-            self.cmb_vd_saved.setCurrentText(saved_name)
             self.status(f"Voice '{saved_name}' saved to voices/{voice_library.slugify(saved_name)}/")
 
         self.run_task(work, done)
@@ -442,40 +425,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edt_vd_name.setText(name)
         self.status(f"Suggested name: {name}")
 
-    def load_saved_into_creator(self):
-        name = self.cmb_vd_saved.currentText()
-        if not name:
-            return
-        cfg, _, _ = voice_library.load_voice(name)
-        self.txt_vd_instruct.setPlainText(cfg["description"])
-        self.cmb_vd_lang.setCurrentText(cfg["language"])
-        self.cmb_vd_seed_mode.setCurrentText("Fixed")
-        self.spn_vd_seed.setValue(cfg["seed"])
-        self.edt_vd_name.setText(cfg["name"])
-        self.status(f"Voice '{name}' loaded into the creator.")
-
-    def play_saved_reference(self):
-        name = self.cmb_vd_saved.currentText()
-        if name:
-            self.play(os.path.join(voice_library.voice_dir(name), "reference.wav"))
-
-    def delete_saved(self):
-        name = self.cmb_vd_saved.currentText()
-        if not name:
-            return
-        answer = QtWidgets.QMessageBox.question(self, "Delete voice?", f"Delete '{name}' and all its files?")
-        if answer == QtWidgets.QMessageBox.Yes:
-            voice_library.delete_voice(name)
-            self.refresh_voice_lists()
-            self.status(f"Voice '{name}' deleted.")
-
     def refresh_voice_lists(self):
         names = voice_library.list_voices()
-        for cmb, items in ((self.cmb_vd_saved, names), (self.cmb_vc_voice, [""] + names)):
-            current = cmb.currentText()
-            cmb.clear()
-            cmb.addItems(items)
-            cmb.setCurrentText(current if current in items else "")
+        self.cmb_vc_voice.clear()
+        self.cmb_vc_voice.addItems([""] + names)
         if hasattr(self, "audiobook_tab"):
             self.audiobook_tab.refresh_voices()
 
