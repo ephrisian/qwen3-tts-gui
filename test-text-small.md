@@ -1,0 +1,1 @@
+Mara crossed the old bridge just before sunset. Rain darkened the road, and a lantern glowed in the window of the tollhouse. The keeper studied her map, then pointed toward a path climbing the hill. At the top, she saw the town clock stopped at seven. Her brother was waiting at the farmhouse beyond it, with a warm kettle on the stove and a story about the clock's missing parts.

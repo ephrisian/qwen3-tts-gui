@@ -391,12 +391,36 @@ def _test_emotion_tags_and_seed():
 
 
 def _test_benchmark_helpers():
-    from benchmark import chunk_bounds, real_time_factor
+    from benchmark import (
+        automatic_chunk_sizes, build_configurations, chunk_bounds, prepare_input_text,
+        real_time_factor,
+    )
     assert chunk_bounds(0) == (0, 0)
     assert chunk_bounds(250) == (200, 250)
     assert chunk_bounds(1) == (1, 1)
     assert real_time_factor(12, 60) == 0.2
     assert real_time_factor(1, 0) is None
+    assert automatic_chunk_sizes("one two three four five six") == [0, 3, 2]
+    sample = "First sentence has four words. Second sentence has five words."
+    assert prepare_input_text(sample, 5) == "First sentence has four words."
+    assert prepare_input_text(sample, 0) == sample
+    one_factor = build_configurations(["cuda"], ["bf16", "fp16"], ["flash", "sdpa"],
+                                      [0, 3], order_seed=5)
+    assert len(one_factor) == 4
+    assert len(set(one_factor)) == 4
+    backends = build_configurations(["cuda"], ["bf16", "fp16"], ["flash", "sdpa"],
+                                    [250, 400], matrix="backends", order_seed=5)
+    assert len(backends) == 4
+    assert {config[3] for config in backends} == {250}
+    assert {(config[1], config[2]) for config in backends} == {
+        ("bf16", "flash"), ("bf16", "sdpa"), ("fp16", "flash"), ("fp16", "sdpa")
+    }
+    chunking = build_configurations(["cuda"], ["bf16"], ["sdpa"], [0, 250, 400],
+                                   matrix="chunking", order_seed=5)
+    assert {config[3] for config in chunking} == {0, 250, 400}
+    full = build_configurations(["cuda"], ["bf16", "fp16"], ["flash", "sdpa"],
+                                [0, 3], matrix="full", order_seed=5)
+    assert len(full) == 8
     print("PASS: benchmark helpers")
 
 

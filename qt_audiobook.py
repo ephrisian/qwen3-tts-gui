@@ -378,6 +378,8 @@ class AudiobookTab(QtWidgets.QWidget):
             self.win.last_output = path
             self.win.btn_play_last.setEnabled(True)
             self.win.status(f"Chapter rendered ({len(segs)} segments, {len(wav) / sr / 60:.1f} min): {path}")
+            print(f"Audiobook generation and compilation complete: {path}", flush=True)
+            QtWidgets.QApplication.beep()
 
         self.win.run_task(work, done)
 

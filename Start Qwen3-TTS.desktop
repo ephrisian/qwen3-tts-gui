@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Qwen3-TTS
+Comment=Launch the Qwen3-TTS GUI
+Terminal=true
+Path=/run/media/epibox/065f34b1-20b6-4b65-ad43-6578b408cb06/Git/qwen3-tts-gui
+Exec=/bin/bash -lc "/run/media/epibox/065f34b1-20b6-4b65-ad43-6578b408cb06/Git/qwen3-tts-gui/manage_qwen.sh run"

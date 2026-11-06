@@ -35,6 +35,10 @@ A desktop GUI for the Qwen3-TTS text-to-speech model, supporting VoiceDesign (vo
 3. Run:
 
    ```bash
+   On Linux, double-click `Start Qwen3-TTS.desktop` in the project folder to launch
+   the GUI without entering a command. The launcher opens a terminal window so startup
+   messages and errors remain visible. If your file manager asks, choose “Allow
+   Launching” or “Trust and Launch”.
    ./manage_qwen.sh install
    ```
 
@@ -86,21 +90,32 @@ Linux/macOS: `./manage_qwen.sh {install|run|remove|cleanup|purge}`
 
 ## Inference benchmark
 
-List saved voices, then benchmark one voice against the same text and seed across
-chunk sizes, dtypes, and attention backends:
+List saved voices, then compare one voice, text, and seed across every backend
+combination for the selected device, dtype, and attention options. The default
+keeps chunk size fixed at 250 words so backend results are directly comparable:
 
 ```bash
 python launch.py benchmark --list-voices
-python launch.py benchmark --voice narrator --text-file benchmark.txt --seed 42 \
-   --chunk-sizes 0,250,400,600 --dtypes bfloat16,float16 \
-   --attentions flash_attention_2,sdpa --warmups 1 --repeats 3
+python launch.py benchmark --voice narrator --text-file test-text.md --seed 42 \
+   --dtypes bfloat16,float16,float32 \
+   --attentions flash_attention_2,sdpa,eager
+python launch.py benchmark --voice narrator --text-file test-text.md --seed 42 \
+   --matrix chunking --chunk-sizes 0,100,250,400
 ```
 
-The benchmark records model-load time separately from warmed generation time,
-reports median real-time factor (lower is faster), and saves a WAV per successful
-configuration for listening comparisons. Results are written to a timestamped
-folder under `output/` as `results.csv`. Use a UTF-8 text file representative of
-your normal workload; the full configuration grid can take a while to run.
+Backend mode defaults to the first 50 words, no warm-up passes, and one measured
+pass per configuration to keep the nine-way sweep quick. Increase `--warmups` and
+`--repeats` for more stable timing, or use `--max-input-words 0` to benchmark the
+entire input. Chunking mode uses the full file by default. Use `--matrix chunking`
+to compare chunk sizes using just the baseline backend; `--matrix full` tests all
+backend and chunk-size combinations. Use `--devices`, `--dtypes`, and
+`--attentions` to select the options to sweep; `--matrix backends` (the default)
+tries every combination of those lists at the same chunk size. Unsupported
+combinations are recorded as failures. The benchmark randomizes configuration
+order, records model-load time separately, and reports median RTF, run-to-run
+spread, and change versus baseline. Results and successful WAVs go to a timestamped
+folder under `output/`. Since the default backend sweep measures each configuration
+once, treat it as a screening run; use repeats for close comparisons.
 
 ## Notes
 
