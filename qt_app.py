@@ -705,19 +705,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_design_tab())
         clone_page = self._build_clone_tab()
         voices_page = self._build_voices_tab()
-        self.audiobook_tab = AudiobookTab(self, text_edit, combo, seed_row)
+        self.audiobook_tab = AudiobookTab(self, text_edit, combo, seed_row, header=page_header)
         for dense in (self.audiobook_tab,):  # not redesigned yet: keep them compact
             dense.setProperty("density", "compact")
         self.stack.addWidget(clone_page)
         self.stack.addWidget(voices_page)
-        lay = self.audiobook_tab.layout()
-        lay.setContentsMargins(24, 24, 24, 16)
-        lay.insertWidget(0, page_header("Audiobooks"))
-        ab_scroll = QtWidgets.QScrollArea()
-        ab_scroll.setWidgetResizable(True)
-        ab_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        ab_scroll.setWidget(self.audiobook_tab)
-        self.stack.addWidget(ab_scroll)
+        self.stack.addWidget(self.audiobook_tab)   # it scrolls its own body and keeps its header and Render in view
         self.drama_tab = DramaTab(self)
         self.drama_tab.setProperty("density", "compact")
         drama_lay = self.drama_tab.layout()
@@ -1096,6 +1089,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for b in self.action_buttons:
             b.setEnabled(not busy)
         self._refresh_save_button()  # re-enabling everything must not enable Save without a sample or name
+        if hasattr(self, "audiobook_tab"):
+            self.audiobook_tab.refresh_actions()   # Preview segment needs exactly one selected segment
 
     def _update_footer(self):
         # Create Voice has its own Play; "last output" only applies to Clone Voice and Audiobook renders.

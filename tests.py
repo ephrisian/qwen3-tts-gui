@@ -1,6 +1,7 @@
 """Unit tests for Qwen3-TTS GUI modules."""
 
 import os
+import shutil
 import sys
 import tempfile
 import wave
@@ -328,6 +329,163 @@ def _test_audiobook_compile():
     out2, _ = audiobook.compile_audio([quiet, loud], pause_ms=0, match_loudness=False)
     assert len(out2) == 1000
     print("PASS: audiobook compile")
+
+
+def _test_audiobook_cache_marker_legacy_entries_and_interrupted_writes():
+    """A cache entry counts only with its completion marker. Older entries (no marker) are unverified: regenerated
+    when needed, never deleted, and kept until a complete replacement exists. Writes are all-or-nothing."""
+    import shutil
+    import audiobook
+    from unittest.mock import patch
+
+    calls = []
+
+    class Gen:
+        def clone(self, **kw):
+            calls.append(1)
+            return [np.full(10, 0.5, dtype=np.float32)], 24000
+    settings = dict(language="english", min_words=0, max_words=0, seed=1, temperature=0.7)
+    seg = audiobook.new_segment("Cache me.", "voice:X")
+    cache = tempfile.mkdtemp()
+    try:
+        path = os.path.join(cache, audiobook.segment_cache_key(seg, settings) + ".npz")
+
+        def entries():
+            return sorted(os.listdir(cache))
+        # a fresh render writes a marked entry through a temporary file that does not remain
+        wav, _ = audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert entries() == [os.path.basename(path)] and len(calls) == 1
+        with np.load(path) as data:
+            assert bool(data["complete"]) and data["wav"].shape == (10,) and int(data["sr"]) == 24000
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == 1, "a marked entry is reused"
+        # legacy entry (written before the marker, possibly truncated): not trusted, not deleted
+        np.savez(path, wav=np.zeros(3, dtype=np.float32), sr=24000)
+        legacy = open(path, "rb").read()
+        # ... and while its replacement cannot be completed, it is still on disk, byte for byte
+        for target, name, error in ((audiobook.os, "replace", OSError("disk full")),
+                                    (audiobook.np, "savez", OSError("write failed"))):
+            n = len(calls)
+            with patch.object(target, name, side_effect=error):
+                try:
+                    audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+                except OSError:
+                    pass   # a failed cache write fails the render, as it always did
+                else:
+                    raise AssertionError("a cache write failure must not be swallowed")
+            assert len(calls) == n + 1, "the legacy entry must not be served"
+            assert open(path, "rb").read() == legacy, "legacy data stays until a complete replacement exists"
+            assert entries() == [os.path.basename(path)], "no temporary file is left behind"
+        # once a replacement is written completely, it takes over and is reused
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        with np.load(path) as data:
+            assert bool(data["complete"]) and data["wav"].shape == (10,)
+        n = len(calls)
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == n
+        # unreadable, empty or explicitly incomplete entries are regenerated and replaced
+        for damage in (b"", b"not an npz file at all"):
+            open(path, "wb").write(damage)
+            n = len(calls)
+            audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+            assert len(calls) == n + 1
+            with np.load(path) as data:
+                assert bool(data["complete"])
+        # a real, marked archive cut in half (a copy interrupted elsewhere) is regenerated, never half-served
+        whole = open(path, "rb").read()
+        open(path, "wb").write(whole[:len(whole) // 2])
+        n = len(calls)
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == n + 1
+        with np.load(path) as data:
+            assert bool(data["complete"]) and data["wav"].shape == (10,)
+        np.savez(path, wav=np.zeros(3, dtype=np.float32), sr=24000, complete=np.False_)
+        n = len(calls)
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == n + 1
+        # nothing is ever removed from the cache folder by rendering
+        stray = os.path.join(cache, "legacy_other_entry.npz")
+        np.savez(stray, wav=np.zeros(2, dtype=np.float32), sr=24000)
+        audiobook.render_segment(Gen(), dict(seg, text="Another."), settings, cache_dir=cache)
+        assert os.path.isfile(stray)
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+    print("PASS: cache entries need a completion marker; legacy entries are regenerated but kept until replaced; writes are all-or-nothing")
+
+
+def _test_audiobook_stop_never_caches_or_returns_a_partial_segment():
+    """Stop during a Qwen segment makes clone() return only the chunks done so far. That partial audio must neither
+    be cached as if complete, nor let a chapter report success. Real TTSGenerator.clone and audiobook functions;
+    only the model is a stand-in."""
+    import shutil
+    import audiobook
+    import voice_library
+    import tts_generator
+    from unittest.mock import patch
+
+    text = " ".join(f"Sentence number {i} is here." for i in range(12))
+    settings = dict(language="english", min_words=10, max_words=12, seed=1, temperature=0.7)
+
+    def make_generator(stop, stop_on_call=None):
+        calls = {"n": 0}
+
+        class Model:
+            def generate_voice_clone(self, **kw):
+                calls["n"] += 1
+                if stop_on_call is not None and calls["n"] == stop_on_call:
+                    stop["v"] = True   # the user presses Stop while this chunk renders
+                return [np.full(1000, 0.1, dtype=np.float32)], 24000
+
+        class Models:
+            def get(self, kind, notify=None):
+                return Model()
+        return tts_generator.TTSGenerator(Models(), notify=lambda m: None, should_stop=lambda: stop["v"])
+
+    with patch.object(voice_library, "load_voice", lambda name: ({"description": "", "seed": 1}, [object()], None)):
+        full_chunks = len(make_generator({"v": False})._jobs(text, 10, 12))
+        assert full_chunks > 2, full_chunks
+        cache = tempfile.mkdtemp()
+        try:
+            # 1. Stop in the middle of one segment: nothing is returned and nothing is cached
+            stop = {"v": False}
+            segment = audiobook.new_segment(text, "voice:X")
+            wav, _ = audiobook.render_segment(make_generator(stop, stop_on_call=1), segment, settings, cache_dir=cache)
+            assert wav is None, "a partially rendered segment must not be returned"
+            assert os.listdir(cache) == [], "a partially rendered segment must not be cached"
+            # 2. The next clean render is complete (it must not find a truncated copy)
+            wav, _ = audiobook.render_segment(make_generator({"v": False}), segment, settings, cache_dir=cache)
+            assert len(wav) == 1000 * full_chunks and len(os.listdir(cache)) == 1
+            # 3. A complete render without Stop is still cached and reused
+            calls_before = len(os.listdir(cache))
+            wav2, _ = audiobook.render_segment(make_generator({"v": False}), segment, settings, cache_dir=cache)
+            assert len(wav2) == len(wav) and len(os.listdir(cache)) == calls_before
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+        # 4. Stop during the LAST segment in render order: the chapter is stopped, not "rendered" with a truncated segment
+        cache = tempfile.mkdtemp()
+        try:
+            stop = {"v": False}
+            gen = make_generator(stop, stop_on_call=2)   # call 1 = the short segment, call 2 = first chunk of the long one
+            segments = [audiobook.new_segment("Short one.", "voice:X"), audiobook.new_segment(text, "voice:X")]
+            with patch.object(audiobook, "SEGMENT_CACHE_DIR", cache), \
+                    patch.object(audiobook.render_segment, "__defaults__", (cache,)):
+                results = audiobook.render_chapter(gen, segments, settings, should_stop=lambda: stop["v"],
+                                                   notify=lambda m: None)
+                assert results is None, "a chapter whose last segment was cut short must report a stop"
+                assert len(os.listdir(cache)) == 1, "only the finished segment is cached"
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+        # 5. Preview segment path: a generator with no stop flag at all behaves as before
+        class Plain:
+            def clone(self, **kw):
+                return [np.zeros(10, dtype=np.float32)], 24000
+        cache = tempfile.mkdtemp()
+        try:
+            wav, _ = audiobook.render_segment(Plain(), audiobook.new_segment("Hi.", "voice:X"), settings, cache_dir=cache)
+            assert wav is not None and len(os.listdir(cache)) == 1
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+    print("PASS: a stopped Qwen segment is never cached or returned, and a chapter stopped in its last segment reports a stop")
 
 
 def _test_audiobook_cache_and_grouping():
@@ -1329,6 +1487,267 @@ def _test_benchmark_helpers():
 
 # ------------------------------------------------------------------ runner
 
+def _cast_fixture(root, name, **config):
+    """A voice folder with the files the engines read; `config` overrides or (None) removes voice.json keys."""
+    import json
+    path = os.path.join(root, name)
+    os.makedirs(path)
+    seconds = config.pop("seconds", 2)
+    if seconds is not None:
+        write_wav(os.path.join(path, "reference.wav"), np.zeros(int(24000 * seconds)), 24000)
+    np.savez(os.path.join(path, "clone_prompt.npz"), x=np.zeros(1))
+    data = {"name": name, "description": "calm", "ref_audio": "reference.wav", "clone_prompt": "clone_prompt.npz",
+            "csm_ref_text": "Hello there."}
+    data.update(config)
+    data = {key: value for key, value in data.items() if value is not None}
+    with open(os.path.join(path, "voice.json"), "w", encoding="utf-8") as voice_file:
+        json.dump(data, voice_file)
+
+
+_ALL_READY = {"xtts": True, "csm": True, "dia": True, "f5": "ok"}
+
+
+def _test_cast_rules_states_and_reasons():
+    import tempfile
+    import cast_rules as cr
+
+    assert cr.parse_key("voice:Ana") == ("qwen", "Ana") and cr.parse_key("f5:A:b") == ("f5", "A:b")
+    assert cr.parse_key("") == (None, "") and cr.parse_key("Ana") == (None, "") and cr.parse_key("zzz:Ana") == (None, "")
+    assert all(cr.parse_key(cr.make_key(engine, "Ana")) == (engine, "Ana") for engine in cr.ENGINES)
+    with tempfile.TemporaryDirectory() as root:
+        _cast_fixture(root, "Ana")
+        _cast_fixture(root, "Bare", description="", csm_ref_text=None)
+        _cast_fixture(root, "Long", seconds=13)
+        _cast_fixture(root, "NoRef", seconds=None)
+        _cast_fixture(root, "NoPrompt", clone_prompt=None)
+        _cast_fixture(root, "OwnF5", f5_ref_audio="f5_reference.wav", f5_ref_text="Short words.")
+        write_wav(os.path.join(root, "OwnF5", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "OwnF5NoKey", f5_ref_audio="f5_reference.wav", f5_ref_text=None)
+        write_wav(os.path.join(root, "OwnF5NoKey", "f5_reference.wav"), np.zeros(24000), 24000)
+
+        def state(key, language="english", direction="", text="Hello.", env=_ALL_READY):
+            return cr.check(key, language, direction, text, root=root, env=env)
+
+        # Ready, with the honest note that only local facts were checked
+        for engine in cr.ENGINES:
+            result = state(cr.make_key(engine, "Ana"))
+            assert result.state == cr.READY and result.issues == () and cr.LOCAL_ONLY_NOTE in result.notes, engine
+        assert state("voice:Ana", language="auto", direction="whisper", text="[sad] Hi.").state == cr.READY
+        # unsupported combinations
+        assert state("xtts:Ana", language="auto").state == cr.UNSUPPORTED
+        assert state("xtts:Ana", language="german").state == cr.READY
+        for engine in ("csm", "dia"):
+            assert state(f"{engine}:Ana", language="french").state == cr.UNSUPPORTED
+        assert state("f5:Ana", language="chinese").state == cr.READY and state("f5:Ana", language="german").state == cr.UNSUPPORTED
+        for engine in ("xtts", "csm", "dia", "f5"):
+            direction = state(f"{engine}:Ana", direction="whisper")
+            tags = state(f"{engine}:Ana", text="[sad] Hi.")
+            assert direction.state == tags.state == cr.UNSUPPORTED and direction.issues[0].cause != tags.issues[0].cause
+            assert state(f"{engine}:Ana", text="Chapter [1] begins.").state == cr.READY, "[1] is not an emotion tag"
+        assert state("voice:Bare", text="[sad] Hi.").state == cr.UNSUPPORTED     # tags need a description
+        assert state("voice:Bare", text="Hi.").state == cr.READY
+        bare_direction = state("voice:Bare", direction="whisper", text="Hi.")  # a direction is sent as a leading [tag]
+        assert bare_direction.state == cr.UNSUPPORTED and "need a voice description" in bare_direction.message
+        assert state("voice:Bare", direction="[whisper]", text="Hi.").state == cr.UNSUPPORTED
+        assert state("voice:Ana", direction="whisper", text="Hi.").state == cr.READY
+        # needs setup: transcript, long F5 reference, packages; the assignment itself stays valid
+        for engine in ("csm", "dia", "f5"):
+            result = state(f"{engine}:Bare")
+            assert result.state == cr.SETUP and "transcript" in result.issues[0].message and "My Voices" in result.issues[0].message
+        assert state("xtts:Bare").state == cr.READY and state("voice:Bare").state == cr.READY
+        assert state("f5:Long").state == cr.SETUP and "12 s" in state("f5:Long").short
+        assert state("csm:Long").state == cr.READY, "the 12 s limit is F5's"
+        assert state("f5:OwnF5").state == cr.READY, "F5 uses its own short reference and transcript when it has one"
+        assert state("f5:OwnF5NoKey").state == cr.SETUP, "its own reference without its own transcript is not the CSM transcript"
+        assert state("csm:OwnF5NoKey").state == cr.READY
+        assert state("xtts:Ana", env={**_ALL_READY, "xtts": False}).state == cr.SETUP
+        assert state("csm:Ana", env={**_ALL_READY, "csm": False}).state == cr.SETUP
+        assert state("dia:Ana", env={**_ALL_READY, "dia": False}).state == cr.SETUP
+        assert state("f5:Ana", env={**_ALL_READY, "f5": "missing"}).state == cr.SETUP
+        unverified = state("f5:Ana", env={**_ALL_READY, "f5": "unverified"})
+        assert unverified.state == cr.READY and any("not inspected" in note for note in unverified.notes)
+        assert any("gated" in note for note in state("csm:Ana").notes) and any("license" in note for note in state("xtts:Ana").notes)
+        # missing: the voice, its reference, its prompt, or an entry this version does not know
+        assert state("voice:Gone").state == cr.MISSING and state("csm:Gone").state == cr.MISSING
+        assert state("xtts:NoRef").state == cr.MISSING and state("voice:NoRef").state == cr.READY
+        assert state("voice:NoPrompt").state == cr.MISSING and state("xtts:NoPrompt").state == cr.READY
+        assert state("legacy").state == cr.MISSING
+        assert state("").state == cr.SETUP and "no voice" in state("").short
+        # the worst state wins, and several causes are all reported
+        both = state("csm:Bare", language="french", direction="x")
+        assert both.state == cr.UNSUPPORTED and len(both.issues) >= 3
+        assert [cr.SEVERITY[item.state] for item in both.issues] == sorted((cr.SEVERITY[item.state] for item in both.issues), reverse=True)
+
+        # pre-flight groups segments by cause and names their rows
+        segments = [{"voice": "voice:Ana", "text": "Hi."}, {"voice": "csm:Bare", "text": "Hi."},
+                    {"voice": "csm:Bare", "text": "Again."}, {"voice": "voice:Gone", "text": "Hi."},
+                    {"voice": "dia:Bare", "text": "Hi."}, {"voice": "", "text": "Hi."}]
+        groups = cr.preflight(segments, "english", root=root, env=_ALL_READY)
+        by_cause = {group.cause: group for group in groups}
+        assert by_cause["setup:csm:transcript:Bare"].rows == (1, 2)
+        assert by_cause["setup:dia:transcript:Bare"].rows == (4,) and by_cause["missing:voice:Gone"].rows == (3,)
+        assert by_cause["setup:none:voice"].rows == (5,) and len(groups) == 4
+        assert groups[0].state == cr.MISSING, "worst first"
+        assert cr.preflight(segments[:1], "english", root=root, env=_ALL_READY) == []
+        assert cr.preflight(segments[1:3], "english", rows=[7, 9], root=root, env=_ALL_READY)[0].rows == (7, 9)
+        # a memo is only a cache of file reads
+        memo = {}
+        assert cr.preflight(segments, "english", root=root, env=_ALL_READY, memo=memo) == groups and memo
+    print("PASS: cast rules: ready, needs setup, unsupported and missing states, reasons, notes and grouped pre-flight")
+
+
+def _test_cast_rules_reference_audio_agrees_with_load_wav():
+    """cast_rules judges a reference from its header; audio_utils.load_wav is what the engines really call."""
+    import struct
+    import tempfile
+    import soundfile as sf
+    import audio_utils
+    import cast_rules as cr
+
+    tone = (0.4 * np.sin(2 * np.pi * 220 * np.arange(24000) / 24000)).astype("float32")
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = {}                                           # file name -> should load_wav accept it
+
+        def audio(name, data=tone, rate=24000, **kw):
+            sf.write(os.path.join(tmp, name), data, rate, **kw)
+            cases[name] = True
+        write_wav(os.path.join(tmp, "pcm16.wav"), tone, 24000)
+        cases["pcm16.wav"] = True
+        audio("pcm8.wav", subtype="PCM_U8")
+        audio("pcm24.wav", subtype="PCM_24")
+        audio("pcm32.wav", subtype="PCM_32")
+        audio("float32.wav", subtype="FLOAT")
+        audio("float64.wav", subtype="DOUBLE")
+        audio("stereo_float.wav", np.stack([tone, -tone], axis=1), subtype="FLOAT")
+        audio("tone.flac", subtype="PCM_24")
+        audio("tone.ogg")
+        if "MP3" in sf.available_formats():
+            audio("tone.mp3")
+        audio("long.wav", np.zeros(24000 * 13, dtype="float32"), subtype="FLOAT")
+        # inputs load_wav refuses: empty, damaged, wrong content, truncated header, missing
+        audio("empty_frames.wav", np.zeros(0, dtype="float32"))
+        cases["empty_frames.wav"] = True    # load_wav returns zero samples without raising (stdlib path); see below
+        for name, payload in (("zero_bytes.wav", b""), ("text.wav", b"not audio at all"),
+                              ("riff_only.wav", b"RIFF" + struct.pack("<I", 4) + b"WAVE"), ("voice.m4a", b"\x00" * 64)):
+            with open(os.path.join(tmp, name), "wb") as handle:
+                handle.write(payload)
+            cases[name] = False
+        with open(os.path.join(tmp, "pcm16.wav"), "rb") as handle:
+            head = handle.read(300)
+        with open(os.path.join(tmp, "cut_header.wav"), "wb") as handle:
+            handle.write(head[:30])
+        cases["cut_header.wav"] = False
+        # cut off mid-data: the header is intact and still claims the full length (an interrupted copy)
+        write_wav(os.path.join(tmp, "pcm16_long.wav"), np.zeros(24000 * 13, dtype="float32"), 24000)
+        long_pcm = open(os.path.join(tmp, "pcm16_long.wav"), "rb").read()
+        for name, size in (("cut_tiny.wav", 44 + 100), ("cut_half.wav", 44 + 24000 * 2 * 5)):
+            with open(os.path.join(tmp, name), "wb") as handle:
+                handle.write(long_pcm[:size])
+            cases[name] = True
+        cases["missing.wav"] = False
+        assert any(ok for ok in cases.values()) and not all(cases.values()), "the fixtures must cover both outcomes"
+
+        for name, ok in cases.items():
+            path = os.path.join(tmp, name)
+            try:
+                audio_utils.load_wav(path)
+                loads = True
+            except (audio_utils.AudioReadError, OSError):
+                loads = False
+            assert loads == ok, f"{name}: load_wav {'read' if loads else 'refused'} it, the fixture says {ok}"
+            seconds = cr._audio_seconds(path, None)
+            if name in ("empty_frames.wav", "cut_tiny.wav"):
+                # Deliberately stricter than load_wav, which hands the engine zero samples: a silent no-op reference
+                # would only fail later, so the pre-flight says so now.
+                assert len(audio_utils.load_wav(path)[0]) < 0.1 * 24000 and seconds is None
+                continue
+            assert (seconds is not None) == loads, f"{name}: cast_rules says {seconds}, load_wav {loads}"
+            if loads:
+                assert abs(seconds - len(audio_utils.load_wav(path)[0]) / audio_utils.load_wav(path)[1]) < 0.01, name
+        # through check(): a readable float / 24-bit reference is Ready, an unreadable one needs setup
+        for name, ready in (("float32.wav", True), ("pcm24.wav", True), ("tone.flac", True), ("text.wav", False),
+                            ("empty_frames.wav", False), ("long.wav", True), ("cut_tiny.wav", False), ("cut_half.wav", True)):
+            voice = "V_" + name.replace(".", "_")
+            _cast_fixture(tmp, voice, seconds=None, ref_audio=name)
+            shutil.copy(os.path.join(tmp, name), os.path.join(tmp, voice, name))
+            for engine in ("csm", "dia", "f5"):
+                result = cr.check(f"{engine}:{voice}", "english", "", "Hello.", root=tmp, env=_ALL_READY)
+                if name == "long.wav" and engine == "f5":
+                    assert result.state == cr.SETUP and "over 12" in result.short, result.short
+                else:
+                    assert (result.state == cr.READY) == ready, (engine, name, result.state, result.short)
+                if not ready:
+                    assert result.short == "reference unreadable", result.short
+        # nothing was decoded: the header read must not call load_wav
+        original = audio_utils.load_wav
+        audio_utils.load_wav = lambda *a, **k: (_ for _ in ()).throw(AssertionError("pre-flight decoded a file"))
+        try:
+            assert cr._audio_seconds(os.path.join(tmp, "float32.wav"), None) is not None
+        finally:
+            audio_utils.load_wav = original
+    print(f"PASS: cast rules read references the way load_wav does ({len(cases)} files: PCM 8/16/24/32-bit, float, "
+          "FLAC, OGG, MP3, empty, damaged, missing), from the header only")
+
+
+def _test_cast_rules_agree_with_the_engines_before_any_model_loads():
+    """For every case the engines would reject on their own checks, cast_rules must not say Ready, and the other way
+    round. The model manager raises a sentinel the moment an engine asks for a model, so the engine's own validation
+    (the part that must match) is exactly what runs."""
+    import itertools
+    import tempfile
+    from unittest.mock import patch
+    import audiobook
+    import cast_rules as cr
+    import tts_generator
+    import voice_library
+
+    class Reached(Exception):
+        pass
+
+    class Models:
+        def get(self, kind, notify=None):
+            raise Reached(kind)
+
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
+        _cast_fixture(root, "Ana")
+        _cast_fixture(root, "Bare", csm_ref_text=None)
+        _cast_fixture(root, "Long", seconds=13)
+        _cast_fixture(root, "NoRef", seconds=None)
+        _cast_fixture(root, "OwnF5", f5_ref_audio="f5_reference.wav", f5_ref_text="Short words.")
+        write_wav(os.path.join(root, "OwnF5", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "OwnF5NoText", f5_ref_audio="f5_reference.wav", f5_ref_text="", csm_ref_text="Fine.")
+        write_wav(os.path.join(root, "OwnF5NoText", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "OwnF5NoKey", f5_ref_audio="f5_reference.wav", f5_ref_text=None, csm_ref_text="Fine.")
+        write_wav(os.path.join(root, "OwnF5NoKey", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "NoPrompt", clone_prompt=None)
+        names = ("Ana", "Bare", "Long", "NoRef", "OwnF5", "OwnF5NoText", "OwnF5NoKey", "NoPrompt", "Gone")
+        checked = refused_cases = accepted_cases = 0
+        with patch.object(voice_library, "VOICES_DIR", root), patch.object(tts_generator, "seed_everything"):
+            generator = tts_generator.TTSGenerator(Models(), notify=lambda message: None)
+            for engine, name, language, direction, text in itertools.product(
+                    cr.ENGINES, names, ("english", "chinese", "auto", "french"), ("", "whisper"),
+                    ("Hello there.", "[sad] Hello there.")):
+                if engine == "qwen" and (direction or "[" in text):
+                    continue    # Qwen checks direction and tags only after its model loads: covered by the unit cases
+                segment = audiobook.new_segment(text, cr.make_key(engine, name), direction=direction)
+                settings = {"language": language, "seed": 1, "temperature": 0.7, "min_words": 1, "max_words": 50}
+                try:
+                    audiobook.render_segment(generator, segment, settings, cache_dir=cache)
+                    refused = False
+                except Reached:
+                    refused = False
+                except Exception:
+                    refused = True
+                state = cr.check_segment(segment, language, root=root, env=_ALL_READY).state
+                assert (state != cr.READY) == refused, (engine, name, language, direction, text, state, refused)
+                checked += 1
+                refused_cases += refused
+                accepted_cases += not refused
+    assert refused_cases > 100 and accepted_cases > 50, (refused_cases, accepted_cases)    # the comparison is not vacuous
+    print(f"PASS: cast rules agree with the real qwen (files), xtts, csm, dia and f5 validation in all {checked} cases "
+          f"({refused_cases} refused, {accepted_cases} accepted; no model loaded)")
+
+
 def run_tests():
     """Run all unit tests."""
     print("Running unit tests...")
@@ -1351,10 +1770,15 @@ def run_tests():
     _test_audiobook_split()
     _test_audiobook_compile()
     _test_audiobook_cache_and_grouping()
+    _test_audiobook_stop_never_caches_or_returns_a_partial_segment()
+    _test_audiobook_cache_marker_legacy_entries_and_interrupted_writes()
     _test_xtts_generation()
     _test_csm_generation()
     _test_dia_generation()
     _test_f5_generation_and_worker()
+    _test_cast_rules_states_and_reasons()
+    _test_cast_rules_reference_audio_agrees_with_load_wav()
+    _test_cast_rules_agree_with_the_engines_before_any_model_loads()
     _test_engine_model_lifecycle()
     _test_voice_library_roundtrip()
     _test_voice_replace_is_failure_safe()

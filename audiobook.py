@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 
 import numpy as np
 
@@ -102,18 +103,45 @@ def segment_cache_key(segment, settings):
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
+def _read_cached(path):
+    """(wav, sr) from a cache file that carries the completion marker, else None.
+    Files without the marker (written before it existed) are unverified: they may hold a truncated segment, so they
+    are ignored and left on disk until a complete replacement is written over them."""
+    try:
+        with np.load(path) as data:
+            if "complete" not in data.files or not bool(data["complete"]):
+                return None
+            return data["wav"], int(data["sr"])
+    except Exception:
+        return None
+
+
+def _write_cached(path, wav, sr):
+    """Write the finished segment with its completion marker. The data goes to a temporary file first and replaces the
+    cache entry only once fully written, so an interrupted write never leaves a half file, and an older entry
+    survives until its replacement is complete. A failed write still fails the render, as before."""
+    tmp = f"{path[:-len('.npz')]}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}.npz"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez(tmp, wav=wav, sr=sr, complete=np.True_)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def render_segment(gen, segment, settings, cache_dir=SEGMENT_CACHE_DIR):
     """Render one segment to (wav, sr), reusing a cached result when nothing changed.
 
     settings: dict(language, min_words, max_words, seed, temperature)
     """
     path = os.path.join(cache_dir, segment_cache_key(segment, settings) + ".npz")
-    if os.path.exists(path):
-        try:
-            data = np.load(path)
-            return data["wav"], int(data["sr"])
-        except Exception:
-            pass
+    cached = _read_cached(path)
+    if cached is not None:
+        return cached
 
     text = apply_direction(segment)
     voice = segment["voice"]
@@ -143,11 +171,15 @@ def render_segment(gen, segment, settings, cache_dir=SEGMENT_CACHE_DIR):
             temperature=settings["temperature"], voice_name=name)
     else:
         raise ValueError(f"Segment has no voice assigned: {segment['text'][:40]!r}")
+    stopped = getattr(gen, "should_stop", None)
+    if stopped is not None and stopped():
+        # Stop was pressed while this segment rendered: Qwen's clone() then returns only the chunks finished so far.
+        # That is not the segment. Return nothing and cache nothing, so a later render makes the whole segment.
+        return None, sr
     if not wavs:
         return None, sr
     wav = np.concatenate([np.asarray(w, dtype=np.float32) for w in wavs])
-    os.makedirs(cache_dir, exist_ok=True)
-    np.savez(path, wav=wav, sr=sr)
+    _write_cached(path, wav, sr)
     return wav, sr
 
 
